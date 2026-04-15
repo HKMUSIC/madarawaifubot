@@ -1,90 +1,164 @@
 import re
-import time
 from html import escape
 from cachetools import TTLCache
-from pymongo import MongoClient, ASCENDING
+from telegram import (
+    Update, 
+    InlineQueryResultPhoto, 
+    InlineQueryResultVideo
+)
+from telegram.constants import ParseMode
+from telegram.ext import InlineQueryHandler, CallbackContext
 
-from telegram import Update, InlineQueryResultPhoto
-from telegram.ext import InlineQueryHandler, CallbackContext, CommandHandler 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from shivu import application, db
+from shivu.modules.zyro_inline import get_user_collection, search_characters, get_all_characters, refresh_character_caches
 
-from shivu import user_collection, collection, application, db
+# Cache instances
+all_characters_cache = TTLCache(maxsize=10000, ttl=300)
+user_collection_cache = TTLCache(maxsize=10000, ttl=30)
 
+# ==============================================================
+#                     INLINE QUERY HANDLER
+# ==============================================================
 
-# collection
-db.characters.create_index([('id', ASCENDING)])
-db.characters.create_index([('anime', ASCENDING)])
-db.characters.create_index([('img_url', ASCENDING)])
+async def inlinequery(update: Update, context: CallbackContext):
+    query = update.inline_query.query.strip()
+    offset = int(update.inline_query.offset or 0)
 
-# user_collection
-db.user_collection.create_index([('characters.id', ASCENDING)])
-db.user_collection.create_index([('characters.name', ASCENDING)])
-db.user_collection.create_index([('characters.img_url', ASCENDING)])
+    force_refresh = False
+    if "!refresh" in query:
+        force_refresh = True
+        query = query.replace("!refresh", "").strip()
+        await refresh_character_caches()
 
-all_characters_cache = TTLCache(maxsize=10000, ttl=36000)
-user_collection_cache = TTLCache(maxsize=10000, ttl=60)
+    # --- Extract AMV flag early ---
+    is_amv = False
+    if ".AMV" in query:
+        is_amv = True
+        query = query.replace(".AMV", "").strip()
 
-async def inlinequery(update: Update, context: CallbackContext) -> None:
-    query = update.inline_query.query
-    offset = int(update.inline_query.offset) if update.inline_query.offset else 0
+    user = None
+    characters = []
 
-    if query.startswith('collection.'):
-        user_id, *search_terms = query.split(' ')[0].split('.')[1], ' '.join(query.split(' ')[1:])
-        if user_id.isdigit():
-            if user_id in user_collection_cache:
-                user = user_collection_cache[user_id]
-            else:
-                user = await user_collection.find_one({'id': int(user_id)})
-                user_collection_cache[user_id] = user
+    # ================= COLLECTION MODE =================
+    if query.startswith("collection."):
+        parts = query.split(" ", 1)
+        target_user_id = parts[0].replace("collection.", "").strip()
+        search = parts[1] if len(parts) > 1 else ""
 
+        if target_user_id.isdigit():
+            user = await get_user_collection(target_user_id)
             if user:
-                all_characters = list({v['id']:v for v in user['characters']}.values())
-                if search_terms:
-                    regex = re.compile(' '.join(search_terms), re.IGNORECASE)
-                    all_characters = [character for character in all_characters if regex.search(character['name']) or regex.search(character['anime'])]
-            else:
-                all_characters = []
-        else:
-            all_characters = []
+                unique = {}
+                for c in user.get("characters", []):
+                    if c and isinstance(c, dict) and "id" in c:
+                        unique[c["id"]] = c
+                characters = list(unique.values())
+
+                if search:
+                    rgx = re.compile(search, re.I)
+                    characters = [
+                        c for c in characters
+                        if rgx.search(str(c.get("name", "")))
+                        or rgx.search(str(c.get("anime", "")))
+                        or rgx.search(" ".join(c.get("aliases", [])))
+                    ]
+
+    # ================= GLOBAL SEARCH =================
     else:
         if query:
-            regex = re.compile(query, re.IGNORECASE)
-            all_characters = list(await collection.find({"$or": [{"name": regex}, {"anime": regex}]}).to_list(length=None))
+            characters = await search_characters(query, force_refresh)
         else:
-            if 'all_characters' in all_characters_cache:
-                all_characters = all_characters_cache['all_characters']
-            else:
-                all_characters = list(await collection.find({}).to_list(length=None))
-                all_characters_cache['all_characters'] = all_characters
+            characters = await get_all_characters(force_refresh)
 
-    characters = all_characters[offset:offset+50]
-    if len(characters) > 50:
-        characters = characters[:50]
-        next_offset = str(offset + 50)
+    # ================= MEDIA FILTER =================
+    if is_amv:
+        characters = [c for c in characters if c.get("vid_url") or c.get("video_url")]
     else:
-        next_offset = str(offset + len(characters))
+        characters = [c for c in characters if c.get("img_url")]
+
+    # ================= PAGINATION =================
+    page = characters[offset: offset + 50]
+    next_offset = str(offset + 50) if len(page) == 50 else None
 
     results = []
-    for character in characters:
-        global_count = await user_collection.count_documents({'characters.id': character['id']})
-        anime_characters = await collection.count_documents({'anime': character['anime']})
 
-        if query.startswith('collection.'):
-            user_character_count = sum(c['id'] == character['id'] for c in user['characters'])
-            user_anime_characters = sum(c['anime'] == character['anime'] for c in user['characters'])
-            caption = f"<b> Look At <a href='tg://user?id={user['id']}'>{(escape(user.get('first_name', user['id'])))}</a>'s Character</b>\n\n🌸: <b>{character['name']} (x{user_character_count})</b>\n🏖️: <b>{character['anime']} ({user_anime_characters}/{anime_characters})</b>\n<b>{character['rarity']}</b>\n\n<b>🆔️:</b> {character['id']}"
-        else:
-            caption = f"<b>Look At This Character !!</b>\n\n🌸:<b> {character['name']}</b>\n🏖️: <b>{character['anime']}</b>\n<b>{character['rarity']}</b>\n🆔️: <b>{character['id']}</b>\n\n<b>Globally Guessed {global_count} Times...</b>"
-        results.append(
-            InlineQueryResultPhoto(
-                thumbnail_url=character['img_url'],
-                id=f"{character['id']}_{time.time()}",
-                photo_url=character['img_url'],
-                caption=caption,
-                parse_mode='HTML'
+    for c in page:
+        cid = str(c.get("id", "0"))
+        
+        # --- SAFE STRINGS FOR ESCAPE() ---
+        c_name = str(c.get('name') or 'Unknown')
+        c_anime = str(c.get('anime') or 'Unknown')
+        c_rarity = str(c.get('rarity') or 'Unknown')
+        
+        # Format list description (Sub-text under the Name)
+        list_description = f"Rarity: {c_rarity}\nID: {cid}"
+
+        # --- DYNAMIC CAPTION LOGIC ---
+        if user:
+            u_name = str(user.get('first_name') or 'User')
+            count = sum(1 for x in user.get("characters", []) if x.get("id") == c.get("id"))
+            
+            caption = (
+                f"<b>👤 {escape(u_name)}'s collection</b>\n\n"
+                f"<b>📛 {escape(c_name)} ×{count}</b>\n"
+                f"<b>🌈 {escape(c_anime)}</b>\n"
+                f"<b>✨ rarity: {c_rarity}</b>\n"
+                f"<b>🆔 <code>{cid}</code></b>"
             )
+        else:
+            caption = (
+                f"<b>📛 {escape(c_name)}</b>\n"
+                f"<b>🌈 {escape(c_anime)}</b>\n"
+                f"<b>✨ rarity: {c_rarity}</b>\n"
+                f"<b>🆔 <code>{cid}</code></b>"
+            )
+
+        # --- MEDIA RESULT ---
+        vid_url = c.get("vid_url") or c.get("video_url")
+        
+        if vid_url:
+            # AMVs always show in List View natively
+            thumb = c.get("thum_url") or c.get("img_url")
+            if not thumb or not str(thumb).startswith("http"):
+                thumb = "https://files.catbox.moe/0v2p69.jpg" 
+
+            results.append(
+                InlineQueryResultVideo(
+                    id=f"v_{cid}_{offset}",
+                    video_url=vid_url,
+                    mime_type="video/mp4",
+                    thumbnail_url=thumb,
+                    title=c_name, 
+                    description=list_description, 
+                    caption=caption,
+                    parse_mode=ParseMode.HTML
+                )
+            )
+        else:
+            img_url = c.get("img_url") or "https://files.catbox.moe/0v2p69.jpg"
+            
+            # Standard Grid View for Images
+            results.append(
+                InlineQueryResultPhoto(
+                    id=f"p_{cid}_{offset}",
+                    photo_url=img_url,
+                    thumbnail_url=img_url,
+                    title=c_name, 
+                    description=list_description, 
+                    caption=caption,
+                    parse_mode=ParseMode.HTML
+                )
+            )
+
+    try:
+        await update.inline_query.answer(
+            results,
+            next_offset=next_offset,
+            cache_time=2 
         )
+    except Exception as e:
+        print(f"Inline Query Error for User {update.inline_query.from_user.id}: {e}")
 
-    await update.inline_query.answer(results, next_offset=next_offset, cache_time=5)
-
+# Register Handlers
 application.add_handler(InlineQueryHandler(inlinequery, block=False))
+    
